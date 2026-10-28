@@ -18,8 +18,10 @@ export const BRIEF_DIR = '.claude/state/auto-handoff'
 // that never count as edits.
 // viewer: where the mod serves the brief pages, "host:port"; "tailscale" as the host means this
 // machine's Tailscale IP, or 127.0.0.1 without Tailscale. Blank: no server, and the link is the local file.
-export type Config = { threshold: number; maxUnattended: number; briefTemplate: string; instructionsTemplate: string; ignoreFiles?: RegExp; viewer: string }
-export const DEFAULTS: Config = { threshold: 160_000, maxUnattended: 2, briefTemplate: '~/.claude/auto-handoff/brief.md', instructionsTemplate: '~/.claude/auto-handoff/instructions.md', viewer: 'tailscale:3846' }
+// checkpointEvery: tokens of growth between rolling-brief passes; 0 (the default) writes the brief
+// once, at the handoff, as before.
+export type Config = { threshold: number; maxUnattended: number; briefTemplate: string; instructionsTemplate: string; ignoreFiles?: RegExp; viewer: string; checkpointEvery: number }
+export const DEFAULTS: Config = { threshold: 160_000, maxUnattended: 2, briefTemplate: '~/.claude/auto-handoff/brief.md', instructionsTemplate: '~/.claude/auto-handoff/instructions.md', viewer: 'tailscale:3846', checkpointEvery: 0 }
 export const MIN_HEADROOM = 40_000
 // Each template's default, a file in the mod's templates/ folder.
 export const TEMPLATES = [['briefTemplate', 'brief.md'], ['instructionsTemplate', 'instructions.md']] as const
@@ -49,6 +51,7 @@ export function parseConfig(options: Record<string, unknown>): Config {
   instructionsTemplate: str(options.instructionsTemplate, DEFAULTS.instructionsTemplate),
   ignoreFiles: pattern(options.ignoreFiles),
   viewer: typeof options.viewer === 'string' ? options.viewer.trim() : DEFAULTS.viewer,
+  checkpointEvery: num(options.checkpointEvery, DEFAULTS.checkpointEvery),
   }
 }
 

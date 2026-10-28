@@ -10,18 +10,21 @@ What was actively being worked on when the session ended.
 Uncommitted changes to files this session touched, services restarted, anything left mid-state.
 
 ## Decisions Made
+<!-- rolling: append -->
 Concrete choices: values, file paths, approach names.
 
 ## Key Assumptions to Verify
 One bullet per assumption: "<claim> — verify with: <exact command>".
 
 ## Questions Answered
+<!-- rolling: append -->
 Things established or resolved, so the next session doesn't re-ask or re-derive them.
 
 ## Open Questions
 Anything unresolved or pending a decision.
 
 ## Dead Ends
+<!-- rolling: append -->
 Approaches tried and ruled out, and why.
 
 ## GitHub Issues

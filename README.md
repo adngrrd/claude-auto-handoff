@@ -56,12 +56,23 @@ Every setting is a row in `/config` under auto-handoff. They're stored in `~/.cl
 | `instructionsTemplate` | `~/.claude/auto-handoff/instructions.md` | Your copy of what the fresh session is told to do |
 | `ignoreFiles` | blank | Regex for edited files to leave out of the brief, such as caches or synced state |
 | `viewer` | `tailscale:3846` | Where to serve the brief pages, as `host:port`. `tailscale` as the host means this machine's Tailscale IP, or `127.0.0.1` when Tailscale isn't set up. Leave blank for no server; the link is then the local file |
+| `checkpointEvery` | `0` | Tokens of growth between rolling-brief passes. `0` writes the brief once, at the handoff. See [Rolling brief](#rolling-brief) |
 
 Environment variables:
 
 - `AUTO_HANDOFF_TOKENS=60000` overrides the threshold for one run, so you can watch a handoff without filling 160k first. It stays set in that shell after the test. Seeded sessions start near 45k, so a value under about 85k leaves them less than 40k of room: the mod then hands off at start + 40k instead and the panel shows `threshold 60k (AUTO_HANDOFF_TOKENS) leaves 15k ...` so you know the override is still live.
 - `AUTO_HANDOFF_DISABLE=1` turns the mod off for one session, viewer server included.
 - `DISABLE_AUTO_COMPACT` also turns it off. When something else manages the context limit, such as a wrapper that pipes the session, `/clear` would break that pipe. The viewer server still runs there.
+
+## Rolling brief
+
+Haiku writes the brief from the last 120 messages. That covers a session handing off at 160k, but at a high threshold on a 1M window most of the session falls outside it.
+
+Set `checkpointEvery` to build the brief as the session grows instead. Each time the context grows by that many tokens, Haiku updates the brief in the background from the brief so far plus only the conversation since the last update. At the threshold, one last pass reads only what came after the latest checkpoint, then the handoff runs as usual. About 100k suits a threshold near 900k: eight or nine short Haiku calls per session.
+
+Sections marked `<!-- rolling: append -->` in `brief.md` accumulate. Haiku writes only what is new and the mod appends it, so an early decision is never summarized away by later passes. The shipped template marks Decisions Made, Questions Answered and Dead Ends. Every other section is rewritten as of the latest pass.
+
+If the last pass fails, the brief from the latest checkpoint is used. Its last-request section is dropped as stale and the facts quote the request instead. The rolling brief is kept at `~/.claude/state/auto-handoff/rolling/<session-id>.json`.
 
 ## Change the brief's structure and rules
 
@@ -106,6 +117,7 @@ The mod hot-reloads when you save while it's loaded with `--plugin-dir`.
 
 ## Changelog
 
+- **0.9.0** Rolling brief: with `checkpointEvery` set, Haiku builds the brief in passes as the session grows, each reading only the conversation since the last, so a brief written at a high threshold covers the whole session. Sections marked `<!-- rolling: append -->` accumulate in code. Off by default.
 - **0.8.6** On a machine without `sh` (Windows), the brief page is still written, and the link opens it as a local file instead of a server that never started. The viewer no longer shells out to `mkdir`.
 - **0.8.5** Windows support, from [@davidboomcycle](https://github.com/davidboomcycle) (#3). The mod falls back to `USERPROFILE` when `HOME` is unset, so briefs no longer land in `<project>/undefined/`. Where there is no `sh`, the log is written through `$.fs`. The tests pass on Windows. The viewer server still needs a POSIX shell.
 - **0.8.4** Any token figure in Haiku's brief that isn't in Handoff Numbers is marked `[unverified: not in Handoff Numbers]` and logged. The figure is marked, not removed.

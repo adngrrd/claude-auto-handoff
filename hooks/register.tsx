@@ -1,5 +1,6 @@
-import type { EngineInterface, Register, Timer } from 'claude-code'
-import { assembleBrief, briefPrompt, extractFacts, isValidBrief, markUnverifiedFigures } from './brief.ts'
+import type { EngineInterface, Register, SessionMessage, Timer } from 'claude-code'
+import { LAST_REQUEST_HEADING, assembleBrief, briefPrompt, dropSection, extractFacts, isValidBrief, markUnverifiedFigures, mergeBrief, rollingPrompt } from './brief.ts'
+import type { Facts, Rolling } from './brief.ts'
 import { chainOf, parseBrief, renderPage, viewerLink, withHeader } from './viewer.ts'
 import type { Entry } from './viewer.ts'
 import { SERVER_JS, parseAddress } from './server.ts'
@@ -51,6 +52,11 @@ let unmeasured = 0
 let gated: string | undefined
 // From the latest SessionStart; /clear starts a new transcript file.
 let transcriptPath: string | undefined
+// The rolling-brief pass under way. One runs at a time, and a handoff waits for it rather than
+// racing it for the brief.
+let checkpointRun: Promise<void> | undefined
+// The token mark of the latest pass, so the check before every request skips the file read.
+let rollingMark: { session: string; tokens: number } | undefined
 
 // Windows sets USERPROFILE, not HOME. With HOME unset, every path built on it began with
 // "undefined/", which $.fs resolves under the session's working directory: briefs, templates
@@ -194,6 +200,64 @@ async function storedLineage($: EngineInterface, sessionId: string): Promise<Lin
   }
 }
 
+// The rolling brief lives on disk, not in $.store: it grows with the session, and the store holds
+// 4 MiB in all. A subfolder, so the viewer never lists it among the briefs.
+async function rollingPath($: EngineInterface, sessionId: string): Promise<string> {
+  return `${await homeDir($)}/${BRIEF_DIR}/rolling/${sessionId}.json`
+}
+
+async function readRolling($: EngineInterface, sessionId: string): Promise<Rolling | undefined> {
+  const text = await readText($, await rollingPath($, sessionId))
+  try { return text ? JSON.parse(text) as Rolling : undefined } catch { return undefined }
+}
+
+// One pass: Haiku reads the brief so far and only the messages after it; code does the merge.
+// Undefined when the reply is unusable.
+async function rollingPass($: EngineInterface, messages: readonly SessionMessage[], previous: Rolling | undefined, facts: Facts, briefTemplate: string): Promise<string | undefined> {
+  // A manual /compact can rewrite the history to fewer messages than the marker; then all of it is new.
+  const from = previous && previous.covered <= messages.length ? previous.covered : 0
+  const result = await $.model.complete({
+    model: 'haiku',
+    system: 'You summarize coding sessions into precise handoff briefs.',
+    prompt: rollingPrompt(previous?.brief, messages.slice(from), facts, briefTemplate),
+    maxTokens: 4_000,
+    timeoutMs: 60_000,
+  })
+  return result.isAnswered && isValidBrief(result.text, briefTemplate) ? mergeBrief(previous?.brief ?? '', result.text, briefTemplate) : undefined
+}
+
+// Every checkpointEvery tokens of growth, one pass in the background. Checked at turn end and
+// before each request, since one long autonomous turn can grow by several intervals.
+function maybeCheckpoint($: EngineInterface, sessionId: string, tokens: number) {
+  if (!cfg.checkpointEvery || checkpointRun || inFlight || pending) return
+  if (rollingMark?.session === sessionId && tokens - rollingMark.tokens < cfg.checkpointEvery) return
+  checkpointRun = checkpoint($, sessionId, tokens).finally(() => { checkpointRun = undefined })
+}
+
+// A failed pass keeps the brief and its marker, so the next pass also reads what this one missed,
+// but still moves the token mark: a Haiku outage costs one retry per interval, not one per request.
+async function checkpoint($: EngineInterface, sessionId: string, tokens: number) {
+  try {
+    const previous = await readRolling($, sessionId)
+    // A seeded session counts from its floor: the brief it was seeded with is not new work.
+    const since = previous?.tokens ?? (sessionId === seededSession ? floor ?? tokens : 0)
+    rollingMark = { session: sessionId, tokens: since }
+    if (tokens - since < cfg.checkpointEvery) return
+    const messages = await $.session.messages()
+    const brief = await rollingPass($, messages, previous, extractFacts(messages, cfg.ignoreFiles), await template($, 'briefTemplate'))
+    const next: Rolling = brief
+      ? { covered: messages.length, tokens, brief, passes: (previous?.passes ?? 0) + 1 }
+      : { covered: previous?.covered ?? 0, tokens, brief: previous?.brief ?? '', passes: previous?.passes ?? 0 }
+    await $.fs.write(await rollingPath($, sessionId), JSON.stringify(next))
+    rollingMark = { session: sessionId, tokens }
+    await log($, brief
+      ? `checkpoint session=${sessionId} tokens=${tokens} covered=${next.covered} pass=${next.passes}`
+      : `checkpoint unusable session=${sessionId} tokens=${tokens}; next try in ${k(cfg.checkpointEvery)}`)
+  } catch (err) {
+    await log($, `checkpoint error session=${sessionId} ${String(err)}`)
+  }
+}
+
 async function handoff($: EngineInterface, sessionId: string, tokens: number, threshold: number) {
   try {
     const own = sessionId === seededSession && lineage ? lineage : await storedLineage($, sessionId)
@@ -209,16 +273,31 @@ async function handoff($: EngineInterface, sessionId: string, tokens: number, th
     const depth = own ? own.depth : 1
     if (depth !== undefined) facts.depth = depth
     const briefTemplate = await template($, 'briefTemplate')
-    const result = await $.model.complete({
-      model: 'haiku',
-      system: 'You summarize coding sessions into precise handoff briefs.',
-      prompt: briefPrompt(messages, facts, briefTemplate),
-      maxTokens: 4_000,
-      timeoutMs: 60_000,
-    })
-    // A failed, empty or sectionless reply falls back to the facts.
-    const text = result.isAnswered ? result.text : ''
-    const problem = !result.isAnswered ? result.reason : !text.trim() ? 'empty' : !isValidBrief(text, briefTemplate) ? 'no-sections' : undefined
+    // A pass under way lands first; then the last pass reads only what came after the latest one.
+    await checkpointRun
+    const rolling = cfg.checkpointEvery ? await readRolling($, sessionId) : undefined
+    let text: string
+    let problem: string | undefined
+    let rolled: { passes: number; complete: boolean } | undefined
+    if (rolling?.brief) {
+      const merged = await rollingPass($, messages, rolling, facts, briefTemplate).catch(() => undefined)
+      // A failed last pass still leaves the brief as of the last checkpoint. Its last-request
+      // section is stale, so it goes, and the facts quote the request instead.
+      if (!merged) await log($, `last rolling pass unusable session=${sessionId}; using the brief from the last checkpoint`)
+      text = merged ?? dropSection(rolling.brief, LAST_REQUEST_HEADING)
+      rolled = { passes: rolling.passes + (merged ? 1 : 0), complete: !!merged }
+    } else {
+      const result = await $.model.complete({
+        model: 'haiku',
+        system: 'You summarize coding sessions into precise handoff briefs.',
+        prompt: briefPrompt(messages, facts, briefTemplate),
+        maxTokens: 4_000,
+        timeoutMs: 60_000,
+      })
+      // A failed, empty or sectionless reply falls back to the facts.
+      text = result.isAnswered ? result.text : ''
+      problem = !result.isAnswered ? result.reason : !text.trim() ? 'empty' : !isValidBrief(text, briefTemplate) ? 'no-sections' : undefined
+    }
     if (problem) await log($, `haiku brief unusable session=${sessionId} reason=${problem}; using facts-only brief`)
     const checked = markUnverifiedFigures(text, facts)
     if (!problem && checked.flagged.length) await log($, `brief figures not in Handoff Numbers session=${sessionId}: ${checked.flagged.join(', ')}`)
@@ -229,6 +308,7 @@ async function handoff($: EngineInterface, sessionId: string, tokens: number, th
       // Claude Code keeps transcripts under the cwd with every non-alphanumeric character as '-'.
       transcript: transcriptPath ?? `~/.claude/projects/${cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${sessionId}.jsonl`,
       instructions: await template($, 'instructionsTemplate') || LAST_RESORT_INSTRUCTIONS,
+      rolling: rolled,
     }, facts, problem ? undefined : checked.text)
     const briefDir = `${home}/${BRIEF_DIR}`
     const briefPath = `${briefDir}/${sessionId}.md`
@@ -439,7 +519,10 @@ export const register: Register = (on, options) => {
         return r
       }
       const threshold = await thresholdFor($, sessionId)
-      if (tokens < threshold && gated !== sessionId) return r
+      if (tokens < threshold && gated !== sessionId) {
+        maybeCheckpoint($, sessionId, tokens)
+        return r
+      }
       await tryHandoff($, sessionId, tokens, threshold, gated === sessionId ? 'turn.complete gated' : 'turn.complete')
     } catch (err) {
       await log($, `turn.complete error ${String(err)}`)
@@ -495,6 +578,7 @@ export const register: Register = (on, options) => {
             yield { kind: 'stop', stopReason: 'end_turn', usage: null }
             return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
           }
+          maybeCheckpoint($, sessionId, tokens)
         }
       } catch (err) {
         await log($, `turn.step error ${String(err)}`)

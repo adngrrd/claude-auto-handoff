@@ -75,15 +75,15 @@ export function extractFacts(messages: readonly SessionMessage[], ignoreFiles?: 
 }
 
 /** The transcript as Haiku reads it. Harness signals are labelled so they are not taken for the user. */
-export function renderTranscript(messages: readonly SessionMessage[]): string {
-  const lines = messages.slice(-MAX_MESSAGES).map(m => {
+export function renderTranscript(messages: readonly SessionMessage[], maxMessages = MAX_MESSAGES, maxChars = MAX_TRANSCRIPT_CHARS): string {
+  const lines = messages.slice(-maxMessages).map(m => {
     const role = m.role === 'user' && m.text.trim() && !userText(m) ? 'system signal (not the user)' : m.role
     const text = m.text.length > MAX_MSG_CHARS ? m.text.slice(0, MAX_MSG_CHARS) + ' [truncated]' : m.text
     const tools = m.toolUses.map(t => `  [tool ${t.tool}${t.isError ? ' ERROR' : ''}] ${JSON.stringify(t.input).slice(0, 300)}`)
     return [`### ${role}`, text, ...tools].filter(Boolean).join('\n')
   })
   const joined = lines.join('\n\n')
-  return joined.length > MAX_TRANSCRIPT_CHARS ? joined.slice(-MAX_TRANSCRIPT_CHARS) : joined
+  return joined.length > maxChars ? joined.slice(-maxChars) : joined
 }
 
 function list(items: string[], empty: string): string {
@@ -119,8 +119,78 @@ ${f.issues.length ? f.issues.join(', ') : 'None.'}`
 }
 
 export function briefPrompt(messages: readonly SessionMessage[], facts: Facts, template: string): string {
-  // Data first, instructions last.
-  return `## Extracted Facts\n${factsBlock(facts)}\n\n## Conversation\n${renderTranscript(messages)}\n\n---\n\n${template.trim()}`
+  // Data first, instructions last. A single pass has nothing to append to, so the marks go.
+  return `## Extracted Facts\n${factsBlock(facts)}\n\n## Conversation\n${renderTranscript(messages)}\n\n---\n\n${template.replaceAll(`${APPEND_MARK}\n`, '').trim()}`
+}
+
+// Rolling brief. With checkpoints on, Haiku updates the brief as the session grows, each pass
+// reading only the conversation since the one before, so a brief written at 900k covers the whole
+// session instead of its last MAX_MESSAGES messages. Sections marked APPEND_MARK in the template
+// accumulate: Haiku writes only what is new and code appends it, so an early decision is never
+// summarized away by later passes. Every other section is rewritten as of the latest pass.
+export const APPEND_MARK = '<!-- rolling: append -->'
+export const LAST_REQUEST_HEADING = '## Last Request from the User'
+// A pass reads every message since the last one, so the message cap goes; the character cap
+// stays, sized to Haiku's window with room for the brief so far.
+const ROLLING_MAX_CHARS = 300_000
+
+/** Where a session's rolling brief stands: messages covered, tokens at the last pass, the brief. */
+export type Rolling = { covered: number; tokens: number; brief: string; passes: number }
+
+type Section = { heading: string; body: string }
+
+function sections(text: string): Section[] {
+  return text.split(/^(?=## )/m).filter(p => p.startsWith('## ')).map(p => {
+    const nl = p.indexOf('\n')
+    return nl === -1 ? { heading: p.trim(), body: '' } : { heading: p.slice(0, nl).trim(), body: p.slice(nl + 1).trim() }
+  })
+}
+
+const joinSections = (list: Section[]) => list.filter(s => s.body).map(s => `${s.heading}\n${s.body}`).join('\n\n')
+
+export function dropSection(text: string, heading: string): string {
+  return joinSections(sections(text).filter(s => sectionKey(s.heading) !== sectionKey(heading)))
+}
+
+export function rollingPrompt(previous: string | undefined, since: readonly SessionMessage[], facts: Facts, template: string): string {
+  return `## Extracted Facts
+${factsBlock(facts)}
+
+## Brief So Far
+<brief-so-far>
+${previous?.trim() || 'None yet: this is the first pass.'}
+</brief-so-far>
+
+## Conversation Since the Brief So Far
+${renderTranscript(since, Infinity, ROLLING_MAX_CHARS)}
+
+---
+
+This is one pass of a rolling handoff brief. The brief so far was written from earlier in this session; the conversation above is everything since. Write the sections below for the session as it stands at the end of that conversation:
+- A section marked ${APPEND_MARK}: write only items from the conversation above that the brief so far does not already hold. Earlier items are kept for you, so do not repeat them. Leave the section out if there is nothing new.
+- Every other section: write its whole current content, carrying forward anything from the brief so far that is still true. Leave it out if it would be empty.
+
+${template.trim()}`
+}
+
+// Haiku's headings are matched loosely ("## Decisions made"), since a section it misspells would
+// otherwise vanish from the merge.
+const sectionKey = (heading: string) => heading.replace(/\s+/g, ' ').trim().toLowerCase()
+const byKey = (text: string) => new Map(sections(text).map(s => [sectionKey(s.heading), s.body]))
+
+/** Haiku's pass merged into the brief so far, in the template's section order. */
+export function mergeBrief(previous: string, update: string, template: string): string {
+  const append = new Set(sections(template).filter(s => s.body.includes(APPEND_MARK)).map(s => sectionKey(s.heading)))
+  const before = byKey(previous)
+  const after = byKey(update.replaceAll(APPEND_MARK, ''))
+  return joinSections(sectionHeadings(template).map(heading => {
+    const fresh = after.get(sectionKey(heading)) ?? ''
+    if (!append.has(sectionKey(heading))) return { heading, body: fresh }
+    const old = before.get(sectionKey(heading)) ?? ''
+    const seen = new Set(old.split('\n').map(l => l.trim()))
+    const added = fresh.split('\n').filter(l => l.trim() && !/^none\.?$/i.test(l.trim()) && !seen.has(l.trim()))
+    return { heading, body: [old, ...added].filter(Boolean).join('\n') }
+  }))
 }
 
 /** A reply that holds none of the template's sections is a dialogue fragment, not a brief. */
@@ -146,6 +216,18 @@ export type BriefContext = {
   transcript: string
   /** The instructions template, rendered at the top of the brief. */
   instructions: string
+  /** Set when a rolling brief was used: its passes, and whether the last one covered the session's end. */
+  rolling?: { passes: number; complete: boolean }
+}
+
+function provenance(ctx: BriefContext, haiku: string | undefined): string {
+  if (!haiku) return 'Haiku did not return a usable brief, so this holds only facts extracted in code. Read the transcript for the rest.'
+  if (!ctx.rolling) return 'Haiku wrote the judgment sections from conversation text with tool output abbreviated. The facts sections came from tool calls in code.'
+  const { passes, complete } = ctx.rolling
+  const built = `Haiku built the judgment sections in ${passes} pass${passes === 1 ? '' : 'es'} as the session grew, each reading only the conversation since the one before, with tool output abbreviated.`
+  return complete
+    ? `${built} The facts sections came from tool calls in code.`
+    : `${built} The last pass failed, so they stop at the last checkpoint: the conversation after it is only in the transcript, and the facts quote the last request.`
 }
 
 export function assembleBrief(ctx: BriefContext, facts: Facts, haiku: string | undefined): string {
@@ -157,9 +239,10 @@ export function assembleBrief(ctx: BriefContext, facts: Facts, haiku: string | u
 - **Transcript:** \`${ctx.transcript}\`
 
 ## How to Use This Brief
-${haiku ? 'Haiku wrote the judgment sections from conversation text with tool output abbreviated. The facts sections came from tool calls in code.' : 'Haiku did not return a usable brief, so this holds only facts extracted in code. Read the transcript for the rest.'} Treat every line as a starting point, not a fact. Before acting on anything here, spawn a subagent to verify: run git status, gh pr view, or Read the file directly. If a fact is missing, grep the transcript before asking the user.`
-  // A valid Haiku brief already quotes the last request in its own section.
-  return [header, haiku?.trim(), factsBlock(facts, !haiku)].filter(Boolean).join('\n\n')
+${provenance(ctx, haiku)} Treat every line as a starting point, not a fact. Before acting on anything here, spawn a subagent to verify: run git status, gh pr view, or Read the file directly. If a fact is missing, grep the transcript before asking the user.`
+  // A valid Haiku brief already quotes the last request in its own section; a rolling brief
+  // whose last pass failed has had that stale section dropped.
+  return [header, haiku?.trim(), factsBlock(facts, !haiku || ctx.rolling?.complete === false)].filter(Boolean).join('\n\n')
 }
 
 // A token figure: "93k", "93.1k", "93,105 tokens", "93105 tokens".

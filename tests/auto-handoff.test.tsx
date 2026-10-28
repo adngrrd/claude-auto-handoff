@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 import type { On, SessionMessage } from 'claude-code'
-import { briefPrompt, extractFacts, factsBlock, hasUnansweredLastRequest, isValidBrief, markUnverifiedFigures } from '../hooks/brief.ts'
+import { APPEND_MARK, briefPrompt, dropSection, extractFacts, factsBlock, hasUnansweredLastRequest, isValidBrief, markUnverifiedFigures, mergeBrief, rollingPrompt } from '../hooks/brief.ts'
 import { renderTemplate } from '../hooks/templates.ts'
 import { parseBrief } from '../hooks/viewer.ts'
 
@@ -56,7 +56,7 @@ const posix = (p: string) => p.replace(/^[A-Za-z]:/, '').replace(/\\/g, '/')
 const files = (written: Record<string, string>) => Object.keys(written).filter(p => !p.endsWith('/auto-handoff.log'))
 
 // The engine beneath the plugin: everything the mod calls, answered from memory.
-function engine(on: On, opts: { tokens: number; files?: Record<string, string>; env?: Record<string, string>; brief?: string | null; messages?: SessionMessage[]; toolChars?: number; streamToolChars?: number; store?: Record<string, unknown>; stepUsage?: boolean; surfaces?: ('terminal' | 'desktop' | 'mobile' | 'vscode')[]; noSh?: boolean }): Calls {
+function engine(on: On, opts: { tokens: number; files?: Record<string, string>; env?: Record<string, string>; brief?: string | null; briefs?: (string | null)[]; messages?: SessionMessage[]; toolChars?: number; streamToolChars?: number; store?: Record<string, unknown>; stepUsage?: boolean; surfaces?: ('terminal' | 'desktop' | 'mobile' | 'vscode')[]; noSh?: boolean }): Calls {
   const calls: Calls = { compacts: 0, steps: 0, cleared: 0, seeded: [], written: {}, completes: 0, tokens: opts.tokens, prompts: [], toasts: [], ran: 0 }
   let sessionId = 'old-session'
   let clears = 0
@@ -85,10 +85,12 @@ function engine(on: On, opts: { tokens: number; files?: Record<string, string>; 
   on('model.complete', async (_$, e) => {
     calls.completes++
     calls.prompts.push(e.prompt)
+    // briefs: one reply per call, in order, for tests that run several passes; then brief.
+    const reply = opts.briefs && calls.completes <= opts.briefs.length ? opts.briefs[calls.completes - 1] : opts.brief
     return {
-      value: opts.brief === null
+      value: reply === null
         ? { isAnswered: false, reason: 'empty-reply', usage: USAGE }
-        : { isAnswered: true, text: opts.brief ?? '## Next Step\nFinish the parser refactor.', usage: USAGE },
+        : { isAnswered: true, text: reply ?? '## Next Step\nFinish the parser refactor.', usage: USAGE },
     }
   })
   on('fs.write', async (_$, e) => {
@@ -917,5 +919,186 @@ describe('markUnverifiedFigures', () => {
 
   test('with no numbers block, any figure is marked', () => {
     expect(markUnverifiedFigures('at 120k', { filesModified: [], commits: [], issues: [] }).flagged).toEqual(['120k'])
+  })
+})
+
+const STATE = '/home/test/.claude/state/auto-handoff'
+const ROLLING_TEMPLATE = `Write a handoff brief.
+
+## Work in Progress
+What is being worked on.
+
+## Decisions Made
+${APPEND_MARK}
+Choices made.
+
+## Last Request from the User
+Copy "Last Real User Message" verbatim. Then "Status: Answered / Partially answered / Not answered".
+
+## Next Step
+The next action.
+`
+const withRollingTemplate = { '/home/test/.claude/auto-handoff/brief.md': ROLLING_TEMPLATE }
+const rollingState = (calls: Calls, session = 'old-session') => JSON.parse(calls.written[`${STATE}/rolling/${session}.json`] ?? 'null')
+
+describe('rolling brief', () => {
+  test('a pass runs once the context grows by checkpointEvery, and not again until it grows that much more', { options: { checkpointEvery: 50_000 } }, async ($, on) => {
+    const calls = engine(on, { tokens: 40_000, files: withRollingTemplate, briefs: ['## Work in Progress\nParser.\n\n## Decisions Made\n- use a Pratt parser'] })
+    await $.turn.complete(TURN)
+    await settle(() => false)
+    expect(calls.completes).toBe(0)
+    calls.tokens = 60_000
+    await $.turn.complete(TURN)
+    await settle(() => rollingState(calls) !== null)
+    expect(calls.completes).toBe(1)
+    expect(calls.cleared).toBe(0)
+    expect(rollingState(calls)).toMatchObject({ covered: 2, tokens: 60_000, passes: 1 })
+    expect(rollingState(calls).brief).toContain('- use a Pratt parser')
+    // The brief lives outside the briefs folder's top level, so the viewer never lists it.
+    expect(files(calls.written)).toEqual([`${STATE}/rolling/old-session.json`])
+    calls.tokens = 100_000
+    await $.turn.complete(TURN)
+    await settle(() => false)
+    expect(calls.completes).toBe(1)
+  })
+
+  test('a long turn checkpoints before its next request, not only at turn end', { options: { checkpointEvery: 50_000 } }, async ($, on) => {
+    const calls = engine(on, { tokens: 70_000, files: withRollingTemplate, briefs: ['## Work in Progress\nParser.'] })
+    await step($)
+    await settle(() => rollingState(calls) !== null)
+    expect(calls.steps).toBe(1)
+    expect(rollingState(calls)).toMatchObject({ tokens: 70_000, passes: 1 })
+  })
+
+  test('at the threshold the last pass reads only what came after the latest checkpoint', { options: { checkpointEvery: 50_000 } }, async ($, on) => {
+    const messages = [msg('user', 'build the parser'), msg('assistant', 'starting with the lexer')]
+    const calls = engine(on, { tokens: 60_000, messages, files: withRollingTemplate, briefs: [
+      '## Work in Progress\nLexer.\n\n## Decisions Made\n- hand-written lexer',
+      '## Work in Progress\nParser.\n\n## Decisions Made\n- hand-written lexer\n- Pratt parser\n\n## Next Step\nWire the parser.',
+    ] })
+    await $.turn.complete(TURN)
+    await settle(() => rollingState(calls) !== null)
+    messages.push(msg('user', 'now the parser'), msg('assistant', 'using Pratt parsing'))
+    calls.tokens = 165_000
+    await $.turn.complete(TURN)
+    await settle(() => calls.cleared > 0)
+    expect(calls.completes).toBe(2)
+    const last = calls.prompts[1] ?? ''
+    expect(last).toContain('using Pratt parsing')
+    expect(last).not.toContain('starting with the lexer')
+    expect(last).toContain('<brief-so-far>\n## Work in Progress\nLexer.')
+    expect(last).toContain('**Tokens at handoff:** 165000')
+    const brief = calls.written[`${STATE}/old-session.md`] ?? ''
+    // The decision Haiku repeated is kept once; the rewritten section replaces the old one.
+    expect(brief).toContain('## Decisions Made\n- hand-written lexer\n- Pratt parser')
+    expect(brief.match(/hand-written lexer/g)?.length).toBe(1)
+    expect(brief).toContain('## Work in Progress\nParser.')
+    expect(brief).not.toContain('Lexer.')
+    expect(brief).toContain('in 2 passes')
+  })
+
+  test('a failed last pass falls back to the latest checkpoint, minus its stale last request', { options: { checkpointEvery: 50_000 } }, async ($, on) => {
+    const messages = [msg('user', 'build the parser'), msg('assistant', 'on it')]
+    const calls = engine(on, { tokens: 60_000, messages, files: withRollingTemplate, briefs: [
+      '## Work in Progress\nLexer.\n\n## Last Request from the User\nbuild the parser\nStatus: Not answered',
+      null,
+    ] })
+    await $.turn.complete(TURN)
+    await settle(() => rollingState(calls) !== null)
+    messages.push(msg('user', 'now the parser'))
+    calls.tokens = 165_000
+    await $.turn.complete(TURN)
+    await settle(() => calls.cleared > 0)
+    const brief = calls.written[`${STATE}/old-session.md`] ?? ''
+    expect(brief).toContain('## Work in Progress\nLexer.')
+    expect(brief).not.toContain('## Last Request from the User')
+    expect(brief).not.toContain('PRIORITY')
+    expect(brief).toContain('## Last Real User Message (verbatim)\nnow the parser')
+    expect(brief).toContain('The last pass failed')
+    expect(calls.written[`${STATE}/auto-handoff.log`]).toContain('last rolling pass unusable session=old-session')
+  })
+
+  test('a failed pass keeps its place and waits a full interval before trying again', { options: { checkpointEvery: 50_000 } }, async ($, on) => {
+    const calls = engine(on, { tokens: 60_000, files: withRollingTemplate, briefs: [null, '## Work in Progress\nParser.'] })
+    await $.turn.complete(TURN)
+    await settle(() => rollingState(calls) !== null)
+    expect(rollingState(calls)).toMatchObject({ covered: 0, tokens: 60_000, brief: '', passes: 0 })
+    calls.tokens = 90_000
+    await $.turn.complete(TURN)
+    await settle(() => false)
+    expect(calls.completes).toBe(1)
+    calls.tokens = 115_000
+    await $.turn.complete(TURN)
+    await settle(() => rollingState(calls)?.passes === 1)
+    expect(calls.completes).toBe(2)
+    // Nothing was covered, so the retry reads the whole conversation.
+    expect(calls.prompts[1]).toContain('please refactor the parser')
+    expect(rollingState(calls)).toMatchObject({ covered: 2, tokens: 115_000 })
+  })
+
+  test('a seeded session counts its checkpoints from its floor', { options: { checkpointEvery: 50_000 } }, async ($, on) => {
+    const calls = engine(on, { tokens: 165_000 })
+    await $.turn.complete(TURN)
+    await settle(() => calls.cleared > 0)
+    await $.classic.SessionStart({ source: 'clear' })
+    await settle(() => calls.seeded.length > 0)
+    calls.tokens = 47_000
+    await $.turn.complete(TURN)
+    calls.tokens = 80_000
+    await $.turn.complete(TURN)
+    await settle(() => false)
+    expect(calls.completes).toBe(1)
+    calls.tokens = 100_000
+    await $.turn.complete(TURN)
+    await settle(() => rollingState(calls, 'new-session-1') !== null)
+    expect(calls.completes).toBe(2)
+    expect(rollingState(calls, 'new-session-1')).toMatchObject({ tokens: 100_000, passes: 1 })
+  })
+
+  test('without checkpointEvery, a session never writes a rolling brief', async ($, on) => {
+    const calls = engine(on, { tokens: 120_000, files: withRollingTemplate })
+    await $.turn.complete(TURN)
+    await settle(() => false)
+    expect(calls.completes).toBe(0)
+    expect(rollingState(calls)).toBeNull()
+  })
+})
+
+describe('mergeBrief', () => {
+  const template = `## Work in Progress\nx\n\n## Decisions Made\n${APPEND_MARK}\nx\n\n## Open Questions\nx`
+
+  test('append sections accumulate without repeats; other sections are replaced, or dropped when left out', () => {
+    const merged = mergeBrief('## Work in Progress\nLexer.\n\n## Decisions Made\n- A\n\n## Open Questions\n- Q1', `## Work in Progress\nParser.\n\n## decisions  made\n${APPEND_MARK}\n- A\n- B\nNone.`, template)
+    expect(merged).toBe('## Work in Progress\nParser.\n\n## Decisions Made\n- A\n- B')
+  })
+
+  test('nothing new in an append section keeps what was there', () => {
+    expect(mergeBrief('## Decisions Made\n- A', '## Work in Progress\nParser.\n\n## Decisions Made\nNone.', template)).toBe('## Work in Progress\nParser.\n\n## Decisions Made\n- A')
+  })
+
+  test('dropSection removes one section and keeps the rest in order', () => {
+    expect(dropSection('## A\n1\n\n## Last Request from the User\nx\n\n## B\n2', '## Last Request from the User')).toBe('## A\n1\n\n## B\n2')
+  })
+})
+
+describe('rolling prompts', () => {
+  const facts = { filesModified: [], commits: [], issues: [], lastUserMessage: 'go' }
+
+  test('a pass carries the brief so far, only the new messages, and the append rule', () => {
+    const prompt = rollingPrompt('## Work in Progress\nLexer.', [msg('assistant', 'new work')], facts, ROLLING_TEMPLATE)
+    expect(prompt).toContain('<brief-so-far>\n## Work in Progress\nLexer.\n</brief-so-far>')
+    expect(prompt).toContain('new work')
+    expect(prompt).toContain(`A section marked ${APPEND_MARK}`)
+    expect(rollingPrompt(undefined, [], facts, ROLLING_TEMPLATE)).toContain('None yet: this is the first pass.')
+  })
+
+  test('a pass reads past the single-pass 120-message cap', () => {
+    const many = Array.from({ length: 200 }, (_, i) => msg('assistant', `step ${i}`))
+    expect(rollingPrompt(undefined, many, facts, ROLLING_TEMPLATE)).toContain('step 0\n')
+    expect(briefPrompt(many, facts, ROLLING_TEMPLATE)).not.toContain('step 0\n')
+  })
+
+  test('a single-pass brief drops the append marks from the template', () => {
+    expect(briefPrompt(BASIC, facts, ROLLING_TEMPLATE)).not.toContain(APPEND_MARK)
   })
 })
